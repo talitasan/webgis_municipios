@@ -3,22 +3,25 @@ WebGIS Municipal - Servidor Flask
 Polígonos fixos no mapa, consulta por clique ou CPD
 """
 
+import os
 import sqlite3
 import struct
 import math
 import json
 import gzip
 import time
+from bisect import bisect_left
 from flask import Flask, request, jsonify, render_template, Response
 
 app = Flask(__name__)
 
-GPKG_PATH = "dados/municipio.gpkg"
+GPKG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dados", "municipio.gpkg")
 LAYER     = "zona_viabilidade"
 
 # Cache do GeoJSON gerado na inicialização
 _geojson_cache: bytes = b""   # bytes gzip
 _geojson_index: dict  = {}    # cpd.upper() → properties dict
+_cpd_sorted:    list  = []    # lista ordenada de CPDs para bisect O(log n)
 
 
 # ── Conversão UTM 23S → WGS84 ─────────────────────────────────────────────────
@@ -43,53 +46,81 @@ def utm_to_latlon(easting, northing):
     return round(math.degrees(lat),6), round(math.degrees(lon)+lon_origin,6)
 
 
-# ── Parser WKB Polygon → lista de anéis [[lon,lat],...] ───────────────────────
-def parse_polygon_wkb(wkb, endian):
-    num_rings = struct.unpack_from(endian+'I', wkb, 5)[0]
-    offset = 9
+# ── Parser WKB ────────────────────────────────────────────────────────────────
+def parse_polygon_wkb(wkb, endian, start=0):
+    """
+    Parse um único Polygon a partir de `start` no buffer `wkb`.
+    Retorna (rings, centroide, próximo_offset) para permitir iteração em MultiPolygon.
+    """
+    num_rings = struct.unpack_from(endian + 'I', wkb, start + 5)[0]
+    offset = start + 9
     rings = []
     cx_sum = cy_sum = cnt = 0
     for _ in range(num_rings):
-        npts = struct.unpack_from(endian+'I', wkb, offset)[0]; offset += 4
+        npts = struct.unpack_from(endian + 'I', wkb, offset)[0]
+        offset += 4
         ring = []
         for _ in range(npts):
-            x, y = struct.unpack_from(endian+'dd', wkb, offset); offset += 16
+            x, y = struct.unpack_from(endian + 'dd', wkb, offset)
+            offset += 16
             lat, lon = utm_to_latlon(x, y)
             ring.append([lon, lat])
-            cx_sum += lon; cy_sum += lat; cnt += 1
+            cx_sum += lon
+            cy_sum += lat
+            cnt += 1
         rings.append(ring)
-    centroide = [round(cx_sum/cnt, 6), round(cy_sum/cnt, 6)] if cnt else None
-    return rings, centroide
+    centroide = [round(cx_sum / cnt, 6), round(cy_sum / cnt, 6)] if cnt else None
+    return rings, centroide, offset
 
 
-def blob_to_rings(blob):
+def blob_to_geometry(blob):
+    """
+    Retorna (geom_type_str, coordinates, centroide) ou (None, None, None).
+    Suporta Polygon (WKB type 3) e MultiPolygon completo (WKB type 6).
+    """
     if not blob:
-        return None, None
+        return None, None, None
     try:
         flags = blob[3]
         env_code = (flags >> 1) & 0b0111
-        env_size = {0:0,1:32,2:48,3:48,4:64}.get(env_code, 0)
-        wkb = blob[8+env_size:]
-        if len(wkb) < 6: return None, None
+        env_size = {0: 0, 1: 32, 2: 48, 3: 48, 4: 64}.get(env_code, 0)
+        wkb = blob[8 + env_size:]
+        if len(wkb) < 6:
+            return None, None, None
         endian = '<' if wkb[0] == 1 else '>'
-        geom_type = struct.unpack_from(endian+'I', wkb, 1)[0]
-        if geom_type == 3:
-            return parse_polygon_wkb(wkb, endian)
-        if geom_type == 6:
-            # MultiPolygon: usar o primeiro polígono
-            num_geoms = struct.unpack_from(endian+'I', wkb, 5)[0]
-            if num_geoms == 0: return None, None
-            sub_endian = '<' if wkb[9] == 1 else '>'
-            sub_wkb = bytes([1]) + wkb[10:]  # reconstruir com byte order
-            return parse_polygon_wkb(b'\x01' + wkb[10:], sub_endian)
-    except Exception:
-        pass
-    return None, None
+        geom_type = struct.unpack_from(endian + 'I', wkb, 1)[0]
+
+        if geom_type == 3:  # Polygon
+            rings, centroide, _ = parse_polygon_wkb(wkb, endian, start=0)
+            return "Polygon", rings, centroide
+
+        if geom_type == 6:  # MultiPolygon — processa TODOS os sub-polígonos
+            num_geoms = struct.unpack_from(endian + 'I', wkb, 5)[0]
+            if num_geoms == 0:
+                return None, None, None
+            all_polys = []
+            cx_sum = cy_sum = cnt = 0
+            offset = 9
+            for _ in range(num_geoms):
+                sub_endian = '<' if wkb[offset] == 1 else '>'
+                rings, sub_centroide, offset = parse_polygon_wkb(wkb, sub_endian, start=offset)
+                all_polys.append(rings)
+                if sub_centroide:
+                    cx_sum += sub_centroide[0]
+                    cy_sum += sub_centroide[1]
+                    cnt += 1
+            centroide = [round(cx_sum / cnt, 6), round(cy_sum / cnt, 6)] if cnt else None
+            return "MultiPolygon", all_polys, centroide
+
+    except Exception as e:
+        print(f"[WebGIS] Erro ao parsear geometria: {e}")
+
+    return None, None, None
 
 
 # ── Construir cache GeoJSON + índice por CPD ──────────────────────────────────
 def build_cache():
-    global _geojson_cache, _geojson_index
+    global _geojson_cache, _geojson_index, _cpd_sorted
     print("[WebGIS] Carregando polígonos do banco...")
     t0 = time.time()
 
@@ -114,23 +145,25 @@ def build_cache():
 
     features = []
     index = {}
+    skipped = 0
 
     for row in rows:
-        rings, centroide = blob_to_rings(row["geom"])
-        if rings is None:
+        geom_type_str, coords, centroide = blob_to_geometry(row["geom"])
+        if geom_type_str is None:
+            skipped += 1
             continue
 
         props = {
             "fid":    row["fid"],
-            "cpd":    row["cpd"]   or "",
-            "cad":    row["cad"]   or "",
-            "log":    row["log"]   or "",
-            "num":    row["num"]   or "",
-            "bairro": row["bairro"]or "",
-            "lote":   row["lote"]  or "",
+            "cpd":    row["cpd"]    or "",
+            "cad":    row["cad"]    or "",
+            "log":    row["log"]    or "",
+            "num":    row["num"]    or "",
+            "bairro": row["bairro"] or "",
+            "lote":   row["lote"]   or "",
             "area":   row["area"],
             "zona":   row["zona"],
-            "mat":    row["mat"]   or "",
+            "mat":    row["mat"]    or "",
             "cx":     centroide[0] if centroide else None,
             "cy":     centroide[1] if centroide else None,
         }
@@ -138,11 +171,10 @@ def build_cache():
         features.append({
             "type":     "Feature",
             "id":       row["fid"],
-            "geometry": {"type": "Polygon", "coordinates": rings},
+            "geometry": {"type": geom_type_str, "coordinates": coords},
             "properties": props,
         })
 
-        # Indexar por CPD para busca instantânea
         if props["cpd"]:
             index[props["cpd"].upper()] = props
 
@@ -150,9 +182,12 @@ def build_cache():
     raw = json.dumps(geojson, separators=(',', ':')).encode()
     _geojson_cache = gzip.compress(raw, compresslevel=6)
     _geojson_index = index
+    _cpd_sorted    = sorted(index.keys())
 
     print(f"[WebGIS] {len(features)} polígonos carregados em {time.time()-t0:.1f}s")
     print(f"[WebGIS] GeoJSON: {len(raw)/1024/1024:.1f} MB → {len(_geojson_cache)/1024/1024:.1f} MB gzip")
+    if skipped:
+        print(f"[WebGIS] AVISO: {skipped} imóvel(is) sem geometria válida ignorado(s)")
 
 
 # ── Rotas ──────────────────────────────────────────────────────────────────────
@@ -176,17 +211,29 @@ def lotes_geojson():
 
 @app.route("/api/cpd/<path:cpd>")
 def buscar_cpd(cpd):
-    """Busca por CPD — retorna properties do imóvel."""
+    """Busca por CPD — exata, prefixo O(log n) via bisect, fallback substring."""
     chave = cpd.strip().upper()
-    # Busca exata primeiro
+
     if chave in _geojson_index:
         return jsonify({"encontrado": True, "imovel": _geojson_index[chave]})
-    # Busca parcial
-    parciais = {k: v for k, v in _geojson_index.items() if chave in k}
-    if len(parciais) == 1:
-        return jsonify({"encontrado": True, "imovel": list(parciais.values())[0]})
-    if parciais:
-        return jsonify({"encontrado": False, "sugestoes": list(parciais.keys())[:10]})
+
+    # Busca por prefixo com bisect O(log n)
+    pos = bisect_left(_cpd_sorted, chave)
+    sugestoes = []
+    for key in _cpd_sorted[pos:pos + 20]:
+        if key.startswith(chave):
+            sugestoes.append(key)
+        else:
+            break
+
+    # Fallback substring O(n) apenas se prefixo não encontrou nada
+    if not sugestoes:
+        sugestoes = [k for k in _cpd_sorted if chave in k][:10]
+
+    if len(sugestoes) == 1:
+        return jsonify({"encontrado": True, "imovel": _geojson_index[sugestoes[0]]})
+    if sugestoes:
+        return jsonify({"encontrado": False, "sugestoes": sugestoes[:10]})
     return jsonify({"encontrado": False, "sugestoes": []})
 
 
