@@ -12,3 +12,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Temporários do Excel
+~$*
+
+# Gerado — reconstruído via planilha xlsx
+dados/cnae_data.js

@@ -15,8 +15,9 @@ from flask import Flask, request, jsonify, render_template, Response
 
 app = Flask(__name__)
 
-GPKG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dados", "municipio.gpkg")
-LAYER     = "zona_viabilidade"
+GPKG_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dados", "municipio.gpkg")
+LAYER      = "zona_viabilidade"
+CENTER_UTM = (200235.6, 7503318.0)   # São Pedro — SIRGAS 2000 UTM 23S
 
 # Cache do GeoJSON gerado na inicialização
 _geojson_cache: bytes = b""   # bytes gzip
@@ -193,7 +194,8 @@ def build_cache():
 # ── Rotas ──────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    return render_template("index.html")
+    lat, lon = utm_to_latlon(*CENTER_UTM)
+    return render_template("index.html", center_lat=lat, center_lon=lon)
 
 
 @app.route("/api/lotes.geojson")
